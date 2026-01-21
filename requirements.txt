@@ -1,8 +1,0 @@
-# Requirements for Vast.ai PyWorker
-# These are installed when PYWORKER_REPO is cloned by start_server.sh
-# 
-# Note: vastai-sdk is installed automatically by start_server.sh
-# Only include additional dependencies your worker.py needs
-
-nltk
-
