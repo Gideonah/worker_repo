@@ -6,7 +6,8 @@ This worker.py configures the Vast serverless proxy to route requests
 to the LTX-2 FastAPI server (api_server.py).
 
 The PyWorker:
-  - Proxies /generate/i2v (image URL), /generate/i2v-base64, and /generate/t2v
+  - Proxies /generate/ltx2/i2v (primary LTX-2 image-to-video endpoint)
+  - Also supports /generate/i2v, /generate/i2v-base64, and /generate/t2v (legacy)
   - Monitors logs for model readiness
   - Runs benchmarks to measure throughput
   - Reports workload metrics for autoscaling
@@ -191,9 +192,9 @@ def t2v_benchmark_generator() -> dict:
 # HANDLER CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Image-to-Video handler (URL input) - Primary endpoint with benchmarking
-i2v_handler = HandlerConfig(
-    route="/generate/i2v",
+# LTX-2 Image-to-Video handler - PRIMARY endpoint with benchmarking
+ltx2_i2v_handler = HandlerConfig(
+    route="/generate/ltx2/i2v",
     
     # Video generation is GPU-bound, process one at a time
     allow_parallel_requests=False,
@@ -211,6 +212,20 @@ i2v_handler = HandlerConfig(
         runs=1,          # Single run since video gen is slow
         concurrency=1,   # Serial execution (GPU-bound)
     ),
+)
+
+# Legacy Image-to-Video handler (URL input) - for backwards compatibility
+i2v_handler = HandlerConfig(
+    route="/generate/i2v",
+    
+    # Video generation is GPU-bound
+    allow_parallel_requests=False,
+    
+    # Allow 10 minutes queue time
+    max_queue_time=600.0,
+    
+    # Workload calculation for autoscaling
+    workload_calculator=calculate_video_workload,
 )
 
 # Image-to-Video handler (base64 input) - Alternative endpoint
@@ -284,7 +299,8 @@ worker_config = WorkerConfig(
     
     # Route handlers
     handlers=[
-        i2v_handler,
+        ltx2_i2v_handler,   # Primary LTX-2 endpoint with benchmarking
+        i2v_handler,        # Legacy endpoint (backwards compatibility)
         i2v_base64_handler,
         t2v_handler,
         health_handler,
@@ -312,9 +328,10 @@ if __name__ == "__main__":
     print(f"  Model Server: {MODEL_SERVER_URL}:{MODEL_SERVER_PORT}")
     print(f"  Log File:     {MODEL_LOG_FILE}")
     print(f"  Routes:")
-    print(f"    - /generate/i2v       (Image URL → Video)")
+    print(f"    - /generate/ltx2/i2v   (LTX-2 Image → Video) [PRIMARY]")
+    print(f"    - /generate/i2v        (Legacy Image → Video)")
     print(f"    - /generate/i2v-base64 (Base64 Image → Video)")
-    print(f"    - /generate/t2v       (Text → Video)")
+    print(f"    - /generate/t2v        (Text → Video)")
     print(f"    - /health, /info")
     print("═══════════════════════════════════════════════════════════════════")
     print("")
