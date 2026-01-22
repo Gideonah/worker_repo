@@ -35,7 +35,7 @@ from vastai import (
 MODEL_SERVER_URL = "http://127.0.0.1"
 MODEL_SERVER_PORT = int(os.environ.get("MODEL_SERVER_PORT", "8000"))
 MODEL_LOG_FILE = os.environ.get("WAN2GP_LOG_FILE", "/var/log/wan2gp/server.log")
-
+MODEL_HEALTHCHECK_ENDPOINT = "/health"
 # LTX-2 specific settings
 LTX2_FPS = 24
 LTX2_MIN_FRAMES = 17
@@ -296,7 +296,7 @@ worker_config = WorkerConfig(
     model_server_url=MODEL_SERVER_URL,
     model_server_port=MODEL_SERVER_PORT,
     model_log_file=MODEL_LOG_FILE,
-    
+    model_healthcheck_endpoint=MODEL_HEALTHCHECK_ENDPOINT,
     # Route handlers
     handlers=[
         ltx2_i2v_handler,   # Primary LTX-2 endpoint with benchmarking
