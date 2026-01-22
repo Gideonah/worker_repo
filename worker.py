@@ -201,7 +201,7 @@ ltx2_i2v_handler = HandlerConfig(
     
     # Video generation can take several minutes
     # Allow 10 minutes queue time before 429
-    max_queue_time=600.0,
+    max_queue_time=10,
     
     # Workload calculation for autoscaling
     workload_calculator=calculate_video_workload,
