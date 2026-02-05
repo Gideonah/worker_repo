@@ -310,7 +310,7 @@ wan22_i2v_handler = HandlerConfig(
     ),
 )
 
-# LTX-2 Image-to-Video handler - PRIMARY LTX endpoint with benchmarking
+# LTX-2 Image-to-Video handler
 ltx2_i2v_handler = HandlerConfig(
     route="/generate/ltx2/i2v",
     
@@ -323,13 +323,6 @@ ltx2_i2v_handler = HandlerConfig(
     
     # Workload calculation for autoscaling
     workload_calculator=calculate_ltx2_workload,
-    
-    # Benchmark configuration
-    benchmark_config=BenchmarkConfig(
-        generator=ltx2_benchmark_generator,
-        runs=1,          # Single run since video gen is slow
-        concurrency=1,   # Serial execution (GPU-bound)
-    ),
 )
 
 # Legacy Image-to-Video handler (URL input) - for backwards compatibility
