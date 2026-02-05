@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-Vast.ai PyWorker for LTX-2 Distilled Video Generation
+Vast.ai PyWorker for Multi-Model Video Generation
 
 This worker.py configures the Vast serverless proxy to route requests
-to the LTX-2 FastAPI server (api_server.py).
+to the FastAPI server (api_server.py) for multiple model types.
+
+Supported Models:
+  - LTX-2 Distilled: Fast image-to-video generation
+  - WAN 2.2 SVI2Pro: High-quality sliding-window image-to-video
 
 The PyWorker:
-  - Proxies /generate/ltx2/i2v (primary LTX-2 image-to-video endpoint)
-  - Also supports /generate/i2v, /generate/i2v-base64, and /generate/t2v (legacy)
+  - Proxies /generate/ltx2/i2v (LTX-2 image-to-video)
+  - Proxies /generate/wan22/i2v (WAN 2.2 image-to-video)
   - Monitors logs for model readiness
   - Runs benchmarks to measure throughput
   - Reports workload metrics for autoscaling
@@ -36,10 +40,17 @@ MODEL_SERVER_URL = "http://127.0.0.1"
 MODEL_SERVER_PORT = int(os.environ.get("MODEL_SERVER_PORT", "8000"))
 MODEL_LOG_FILE = os.environ.get("WAN2GP_LOG_FILE", "/var/log/wan2gp/server.log")
 MODEL_HEALTHCHECK_ENDPOINT = "/health"
+
 # LTX-2 specific settings
 LTX2_FPS = 24
 LTX2_MIN_FRAMES = 17
 LTX2_FRAME_STEP = 8
+
+# WAN 2.2 specific settings
+WAN22_FPS = 24  # Native FPS before RIFE upsampling
+WAN22_RIFE2_FPS = 48  # After RIFE 2x upsampling
+WAN22_RIFE4_FPS = 96  # After RIFE 4x upsampling
+WAN22_DEFAULT_STEPS = 4  # Lightning v2 uses 4 steps
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOG ACTION PATTERNS
@@ -83,7 +94,7 @@ MODEL_INFO_PATTERNS = [
 # UTILITY FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def duration_to_frames(duration_seconds: float) -> int:
+def ltx2_duration_to_frames(duration_seconds: float) -> int:
     """Convert duration in seconds to valid frame count for LTX-2."""
     target_frames = int(duration_seconds * LTX2_FPS)
     if target_frames < LTX2_MIN_FRAMES:
@@ -92,13 +103,24 @@ def duration_to_frames(duration_seconds: float) -> int:
     return LTX2_MIN_FRAMES + (n * LTX2_FRAME_STEP)
 
 
+def wan22_duration_to_frames(duration_seconds: float, temporal_upsampling: str = "rife2") -> int:
+    """Convert duration in seconds to frame count for WAN 2.2."""
+    if temporal_upsampling == "rife4":
+        fps = WAN22_RIFE4_FPS
+    elif temporal_upsampling == "rife2":
+        fps = WAN22_RIFE2_FPS
+    else:
+        fps = WAN22_FPS
+    return int(duration_seconds * fps)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # WORKLOAD CALCULATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def calculate_video_workload(payload: dict) -> float:
+def calculate_ltx2_workload(payload: dict) -> float:
     """
-    Calculate workload for a video generation request.
+    Calculate workload for an LTX-2 video generation request.
     
     Workload is proportional to:
       - Duration/frames (more frames = more work)
@@ -109,7 +131,7 @@ def calculate_video_workload(payload: dict) -> float:
     """
     # Extract parameters with LTX-2 defaults
     duration = payload.get("duration", 5.0)
-    num_frames = payload.get("num_frames", duration_to_frames(duration))
+    num_frames = payload.get("num_frames", ltx2_duration_to_frames(duration))
     width = payload.get("width", 768)
     height = payload.get("height", 512)
     num_inference_steps = payload.get("num_inference_steps", 8)  # LTX-2 distilled uses 8 steps
@@ -127,6 +149,57 @@ def calculate_video_workload(payload: dict) -> float:
     step_factor = num_inference_steps / base_steps
     
     workload = base_workload * frame_factor * pixel_factor * step_factor
+    
+    return workload
+
+
+def calculate_wan22_workload(payload: dict) -> float:
+    """
+    Calculate workload for a WAN 2.2 video generation request.
+    
+    WAN 2.2 with sliding window can generate very long videos,
+    so workload scales primarily with duration and resolution.
+    """
+    # Extract parameters with WAN 2.2 defaults
+    duration = payload.get("duration", 5.0)
+    temporal_upsampling = payload.get("temporal_upsampling", "rife2")
+    num_frames = wan22_duration_to_frames(duration, temporal_upsampling)
+    
+    # Resolution - check preset or explicit dimensions
+    resolution_preset = payload.get("resolution_preset", "480p")
+    width = payload.get("width")
+    height = payload.get("height")
+    
+    if width is None or height is None:
+        # Parse from preset
+        if "720" in resolution_preset:
+            width, height = 1280, 720
+        elif "576" in resolution_preset:
+            width, height = 1024, 576
+        else:  # 480p or default
+            width, height = 832, 480
+    
+    num_inference_steps = payload.get("num_inference_steps", 4)
+    
+    # Base workload: 5s video @ 480p @ 4 steps = 1000 units
+    base_duration = 5.0
+    base_pixels = 832 * 480
+    base_steps = 4
+    base_workload = 1000.0
+    
+    # Calculate relative workload
+    duration_factor = duration / base_duration
+    pixel_factor = (width * height) / base_pixels
+    step_factor = num_inference_steps / base_steps
+    
+    # Sliding window adds overhead for long videos
+    if duration > 5.0:
+        # Sliding window overhead (~10% per additional 5s)
+        sliding_window_factor = 1.0 + (0.1 * (duration - 5.0) / 5.0)
+    else:
+        sliding_window_factor = 1.0
+    
+    workload = base_workload * duration_factor * pixel_factor * step_factor * sliding_window_factor
     
     return workload
 
@@ -149,9 +222,9 @@ BENCHMARK_IMAGE_URLS = [
 ]
 
 
-def i2v_benchmark_generator() -> dict:
+def ltx2_benchmark_generator() -> dict:
     """
-    Generate a benchmark payload for /generate/i2v endpoint.
+    Generate a benchmark payload for /generate/ltx2/i2v endpoint.
     
     Uses smaller parameters for faster benchmark completion while
     still exercising the full pipeline.
@@ -166,6 +239,29 @@ def i2v_benchmark_generator() -> dict:
         "width": 512,           # Smaller for faster benchmark
         "height": 512,          # Square aspect ratio
         "guidance_scale": 4.0,
+        "seed": random.randint(0, 2**31 - 1),
+    }
+
+
+def wan22_benchmark_generator() -> dict:
+    """
+    Generate a benchmark payload for /generate/wan22/i2v endpoint.
+    
+    Uses minimal parameters for quick benchmark.
+    """
+    prompt = random.choice(BENCHMARK_PROMPTS)
+    image_url = random.choice(BENCHMARK_IMAGE_URLS)
+    
+    return {
+        "prompt": prompt,
+        "image_url": image_url,
+        "duration": 2.0,              # Short duration for benchmark
+        "resolution_preset": "480p",
+        "num_inference_steps": 4,     # Lightning v2 default
+        "guidance_scale": 1.0,
+        "guidance2_scale": 1.0,
+        "flow_shift": 5.0,
+        "temporal_upsampling": "rife2",
         "seed": random.randint(0, 2**31 - 1),
     }
 
@@ -192,7 +288,29 @@ def t2v_benchmark_generator() -> dict:
 # HANDLER CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# LTX-2 Image-to-Video handler - PRIMARY endpoint with benchmarking
+# WAN 2.2 Image-to-Video handler - PRIMARY WAN endpoint with benchmarking
+wan22_i2v_handler = HandlerConfig(
+    route="/generate/wan22/i2v",
+    
+    # Video generation is GPU-bound, process one at a time
+    allow_parallel_requests=False,
+    
+    # Video generation can take several minutes (especially long videos)
+    # Allow 15 minutes queue time before 429
+    max_queue_time=900.0,
+    
+    # Workload calculation for autoscaling
+    workload_calculator=calculate_wan22_workload,
+    
+    # Benchmark configuration
+    benchmark_config=BenchmarkConfig(
+        generator=wan22_benchmark_generator,
+        runs=1,          # Single run since video gen is slow
+        concurrency=1,   # Serial execution (GPU-bound)
+    ),
+)
+
+# LTX-2 Image-to-Video handler - PRIMARY LTX endpoint with benchmarking
 ltx2_i2v_handler = HandlerConfig(
     route="/generate/ltx2/i2v",
     
@@ -201,14 +319,14 @@ ltx2_i2v_handler = HandlerConfig(
     
     # Video generation can take several minutes
     # Allow 10 minutes queue time before 429
-    max_queue_time=10,
+    max_queue_time=600.0,
     
     # Workload calculation for autoscaling
-    workload_calculator=calculate_video_workload,
+    workload_calculator=calculate_ltx2_workload,
     
     # Benchmark configuration
     benchmark_config=BenchmarkConfig(
-        generator=i2v_benchmark_generator,
+        generator=ltx2_benchmark_generator,
         runs=1,          # Single run since video gen is slow
         concurrency=1,   # Serial execution (GPU-bound)
     ),
@@ -225,7 +343,7 @@ i2v_handler = HandlerConfig(
     max_queue_time=600.0,
     
     # Workload calculation for autoscaling
-    workload_calculator=calculate_video_workload,
+    workload_calculator=calculate_ltx2_workload,
 )
 
 # Image-to-Video handler (base64 input) - Alternative endpoint
@@ -239,7 +357,7 @@ i2v_base64_handler = HandlerConfig(
     max_queue_time=600.0,
     
     # Same workload calculation
-    workload_calculator=calculate_video_workload,
+    workload_calculator=calculate_ltx2_workload,
 )
 
 # Text-to-Video handler
@@ -253,7 +371,7 @@ t2v_handler = HandlerConfig(
     max_queue_time=600.0,
     
     # Same workload calculation
-    workload_calculator=calculate_video_workload,
+    workload_calculator=calculate_ltx2_workload,
 )
 
 # Health check handler (simple pass-through)
@@ -297,9 +415,11 @@ worker_config = WorkerConfig(
     model_server_port=MODEL_SERVER_PORT,
     model_log_file=MODEL_LOG_FILE,
     model_healthcheck_endpoint=MODEL_HEALTHCHECK_ENDPOINT,
+    
     # Route handlers
     handlers=[
-        ltx2_i2v_handler,   # Primary LTX-2 endpoint with benchmarking
+        wan22_i2v_handler,  # WAN 2.2 endpoint with benchmarking
+        ltx2_i2v_handler,   # LTX-2 endpoint with benchmarking
         i2v_handler,        # Legacy endpoint (backwards compatibility)
         i2v_base64_handler,
         t2v_handler,
@@ -323,12 +443,13 @@ worker_config = WorkerConfig(
 
 if __name__ == "__main__":
     print("═══════════════════════════════════════════════════════════════════")
-    print("  LTX-2 Distilled PyWorker for Vast.ai Serverless")
+    print("  Multi-Model PyWorker for Vast.ai Serverless")
     print("═══════════════════════════════════════════════════════════════════")
     print(f"  Model Server: {MODEL_SERVER_URL}:{MODEL_SERVER_PORT}")
     print(f"  Log File:     {MODEL_LOG_FILE}")
     print(f"  Routes:")
-    print(f"    - /generate/ltx2/i2v   (LTX-2 Image → Video) [PRIMARY]")
+    print(f"    - /generate/wan22/i2v  (WAN 2.2 Image → Video) [PRIMARY]")
+    print(f"    - /generate/ltx2/i2v   (LTX-2 Image → Video)")
     print(f"    - /generate/i2v        (Legacy Image → Video)")
     print(f"    - /generate/i2v-base64 (Base64 Image → Video)")
     print(f"    - /generate/t2v        (Text → Video)")
@@ -338,4 +459,3 @@ if __name__ == "__main__":
     
     # Start the PyWorker
     Worker(worker_config).run()
-
